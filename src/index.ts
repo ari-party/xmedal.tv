@@ -14,7 +14,7 @@ const app = express();
 app.disable('x-powered-by');
 
 app.get('/', (_req, res) =>
-  res.redirect('https://github.com/ari-party/xmedal.tv'),
+  res.redirect('https://github.com/ari-party/xmedal.tv#xmedaltv'),
 );
 
 app.get('/health', (_req, res) => {
