@@ -7,8 +7,7 @@ import { env } from '@/env';
 import { log } from '@/pino';
 import { redis } from '@/redis';
 import { getCachedContentUrl, setCachedContentUrl } from '@/utils/cache';
-import { extractJsonLdScripts, parseJsonLd } from '@/utils/jsonLd';
-import { getFullUrl } from '@/utils/medal';
+import { extractContentUrl, getFullUrl } from '@/utils/medal';
 
 const app = express();
 
@@ -44,15 +43,10 @@ app.get('/*splat', async (req, res) => {
           }
 
         const html = await response.text();
-        const [jsonLdString] = extractJsonLdScripts(html);
-        if (!jsonLdString) return res.status(404).end();
+        const extractedContentUrl = html && extractContentUrl(html);
+        if (!extractedContentUrl) return res.status(404).end();
 
-        const jsonLd = parseJsonLd(jsonLdString);
-        if (!jsonLd) return;
-        if (jsonLd['@type'] !== 'VideoObject') return;
-        if (!jsonLd.contentUrl || typeof jsonLd.contentUrl !== 'string') return;
-
-        contentUrl = jsonLd.contentUrl as string;
+        contentUrl = extractedContentUrl;
 
         await setCachedContentUrl(key, contentUrl);
       }
