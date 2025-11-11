@@ -32,6 +32,8 @@ app.get('/*splat', async (req, res) => {
 
   if (env.NODE_ENV === 'development' || isbot(req.get('user-agent'))) {
     try {
+      const start = performance.now();
+
       let contentUrl = await getCachedContentUrl(key);
       if (!contentUrl) {
         const response = await ky.get(fullUrl);
@@ -56,6 +58,9 @@ app.get('/*splat', async (req, res) => {
 
         await setCachedContentUrl(key, contentUrl);
       }
+
+      const end = performance.now();
+      res.setHeader('x-medal-lookup', `${((end - start) / 1_000).toFixed(4)}s`);
 
       res.redirect(contentUrl);
     } catch (err) {
