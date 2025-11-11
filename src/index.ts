@@ -4,6 +4,7 @@ import slug from 'slug';
 
 import { env } from '@/env';
 import { log } from '@/pino';
+import { redis } from '@/redis';
 import { getCachedContentUrl, setCachedContentUrl } from '@/utils/cache';
 import { extractJsonLdScripts, parseJsonLd } from '@/utils/jsonLd';
 import { getFullUrl } from '@/utils/medal';
@@ -17,6 +18,13 @@ app.disable('x-powered-by');
 app.get('/', (_req, res) =>
   res.redirect('https://github.com/ari-party/xmedal.tv'),
 );
+
+app.get('/health', (_req, res) => {
+  if (redis.status === 'ready') res.status(200).write('OK');
+  else res.status(503).write('NOT OK');
+
+  res.end();
+});
 
 app.get('/*splat', async (req, res) => {
   const path = req.path.replace(/^\//, '');
