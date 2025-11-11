@@ -34,7 +34,7 @@ app.get('/*splat', async (req, res) => {
     try {
       let contentUrl = await getCachedContentUrl(key);
       if (!contentUrl) {
-        const response = await ky.get(fullUrl);
+        const response = await ky.get(fullUrl, { throwHttpErrors: false });
         if (!response.ok)
           switch (response.status) {
             case 404:
