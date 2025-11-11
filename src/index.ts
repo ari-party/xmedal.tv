@@ -1,0 +1,71 @@
+import express from 'express';
+import ky from 'ky';
+import slug from 'slug';
+
+import { env } from '@/env';
+import { log } from '@/pino';
+import { getCachedContentUrl, setCachedContentUrl } from '@/utils/cache';
+import { extractJsonLdScripts, parseJsonLd } from '@/utils/jsonLd';
+import { getFullUrl } from '@/utils/medal';
+
+const USER_AGENTS = ['Twitterbot', 'Discordbot'];
+
+const app = express();
+
+app.disable('x-powered-by');
+
+app.get('/', (_req, res) =>
+  res.redirect('https://github.com/ari-party/xmedal.tv'),
+);
+
+app.get('/*splat', async (req, res) => {
+  const path = req.path.replace(/^\//, '');
+  const key = slug(path);
+  const userAgent = req.headers['user-agent'];
+
+  const fullUrl = getFullUrl(path);
+
+  if (
+    env.NODE_ENV === 'development' ||
+    (userAgent && USER_AGENTS.some((pattern) => userAgent.includes(pattern)))
+  ) {
+    try {
+      let contentUrl = await getCachedContentUrl(key);
+      if (!contentUrl) {
+        const response = await ky.get(fullUrl);
+        if (!response.ok)
+          switch (response.status) {
+            case 404:
+              return res.status(404).end();
+            default:
+              return;
+          }
+
+        const html = await response.text();
+        const [jsonLdString] = extractJsonLdScripts(html);
+        if (!jsonLdString) return res.status(404).end();
+
+        const jsonLd = parseJsonLd(jsonLdString);
+        if (!jsonLd) return;
+        if (jsonLd['@type'] !== 'VideoObject') return;
+        if (!jsonLd.contentUrl || typeof jsonLd.contentUrl !== 'string') return;
+
+        contentUrl = jsonLd.contentUrl as string;
+
+        await setCachedContentUrl(key, contentUrl);
+      }
+
+      res.redirect(contentUrl);
+    } catch (err) {
+      log.error(err);
+    } finally {
+      if (!res.headersSent) res.status(500).end();
+    }
+  }
+
+  res.redirect(fullUrl);
+});
+
+app.listen(env.PORT, '0.0.0.0', () =>
+  log.info(`Server listening on 0.0.0.0:${env.PORT}`),
+);
