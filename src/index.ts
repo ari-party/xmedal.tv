@@ -1,4 +1,5 @@
 import express from 'express';
+import { isbot } from 'isbot';
 import ky from 'ky';
 import slug from 'slug';
 
@@ -8,8 +9,6 @@ import { redis } from '@/redis';
 import { getCachedContentUrl, setCachedContentUrl } from '@/utils/cache';
 import { extractJsonLdScripts, parseJsonLd } from '@/utils/jsonLd';
 import { getFullUrl } from '@/utils/medal';
-
-const USER_AGENTS = ['Twitterbot', 'Discordbot'];
 
 const app = express();
 
@@ -29,14 +28,9 @@ app.get('/health', (_req, res) => {
 app.get('/*splat', async (req, res) => {
   const path = req.path.replace(/^\//, '');
   const key = slug(path);
-  const userAgent = req.headers['user-agent'];
-
   const fullUrl = getFullUrl(path);
 
-  if (
-    env.NODE_ENV === 'development' ||
-    (userAgent && USER_AGENTS.some((pattern) => userAgent.includes(pattern)))
-  ) {
+  if (env.NODE_ENV === 'development' || isbot(req.get('user-agent'))) {
     try {
       let contentUrl = await getCachedContentUrl(key);
       if (!contentUrl) {
