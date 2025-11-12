@@ -24,16 +24,17 @@ var (
 	errNotFound = errors.New("content not found")
 
 	fetchGroup singleflight.Group
+
+	genericUserAgent = "Mozilla/5.0 (compatible; xmedaltv/1.0; +https://xmedal.tv)"
 )
 
-func fetchContentURL(ctx context.Context, url, userAgent string) (string, error) {
+func fetchContentURL(ctx context.Context, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	}
+
+	req.Header.Set("User-Agent", genericUserAgent)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -83,7 +84,7 @@ func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
 
 		if contentURL == "" {
 			result, fetchErr, _ := fetchGroup.Do(key, func() (interface{}, error) {
-				fetchedURL, innerErr := fetchContentURL(ctx, fullURL, r.UserAgent())
+				fetchedURL, innerErr := fetchContentURL(ctx, fullURL)
 				if innerErr != nil {
 					return "", innerErr
 				}
