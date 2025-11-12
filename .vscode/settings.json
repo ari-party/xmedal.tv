@@ -2,7 +2,5 @@
   "[dockerfile]": {
     "editor.defaultFormatter": "ms-azuretools.vscode-containers"
   },
-  "files.eol": "\r\n",
-  "typescript.enablePromptUseWorkspaceTsdk": true,
-  "typescript.preferences.importModuleSpecifier": "non-relative"
+  "files.eol": "\r\n"
 }
