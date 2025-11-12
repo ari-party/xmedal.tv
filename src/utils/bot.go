@@ -3,7 +3,7 @@ package utils
 import (
 	"strings"
 
-	"github.com/avct/uasurfer"
+	"github.com/mssola/useragent"
 )
 
 func IsBot(userAgent string) bool {
@@ -12,6 +12,6 @@ func IsBot(userAgent string) bool {
 		return false
 	}
 
-	result := uasurfer.Parse(ua)
-	return result.IsBot()
+	result := useragent.New(ua)
+	return result.Bot()
 }
