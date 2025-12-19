@@ -3,10 +3,22 @@ package utils
 import (
 	"errors"
 	"fmt"
+	"net/url"
 )
 
 func GetFullURL(path string) string {
-	return fmt.Sprintf("https://medal.tv/%s", path)
+	fullURL := fmt.Sprintf("https://medal.tv/%s", path)
+
+	parsedURL, err := url.Parse(fullURL)
+	if err != nil {
+		return fullURL // Return original if parsing fails
+	}
+
+	// Remove query parameters and fragment
+	parsedURL.RawQuery = ""
+	parsedURL.Fragment = ""
+
+	return parsedURL.String()
 }
 
 func ExtractContentURL(html string) (string, error) {

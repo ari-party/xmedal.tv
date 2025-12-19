@@ -135,7 +135,6 @@ func main() {
 	cfg := utils.LoadConfig()
 	log := utils.Logger()
 
-	// Initialise Redis connection early
 	redis.Client()
 
 	mux := http.NewServeMux()
