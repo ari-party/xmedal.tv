@@ -5,7 +5,7 @@ import (
 	"regexp"
 )
 
-var scriptRegex = regexp.MustCompile(`<script type="application/ld\+json">([\s\S]*?)</script>`)
+var scriptRegex = regexp.MustCompile(`<script[^>]*type="application/ld\+json"[^>]*>([\s\S]*?)</script>`)
 
 func ExtractJSONLDScripts(html string) []string {
 	matches := scriptRegex.FindAllStringSubmatch(html, -1)
