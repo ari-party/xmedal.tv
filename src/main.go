@@ -65,9 +65,14 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 	}
 
 	if parsed, err := url.Parse(raw); err == nil {
-		q := parsed.Query()
-		q.Del("t")
-		parsed.RawQuery = q.Encode()
+		parts := strings.Split(parsed.RawQuery, "&")
+		filtered := parts[:0]
+		for _, p := range parts {
+			if p != "" && !strings.HasPrefix(p, "t=") {
+				filtered = append(filtered, p)
+			}
+		}
+		parsed.RawQuery = strings.Join(filtered, "&")
 		return parsed.String(), nil
 	}
 	return raw, nil
