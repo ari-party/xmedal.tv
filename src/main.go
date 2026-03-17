@@ -147,7 +147,7 @@ func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
 					return "", innerErr
 				}
 
-				if err := redis.SetCachedContentURL(ctx, key, fetchedURL); err != nil {
+				if err := redis.SetCachedContentURL(ctx, key, fetchedURL, utils.ExtractMedalExpiry(fetchedURL)); err != nil {
 					log.Error("failed to cache content url", "error", err)
 				}
 
