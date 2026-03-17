@@ -4,7 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 )
+
+func ExtractClipID(path string) string {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	for i := len(segments) - 1; i >= 0; i-- {
+		if segments[i] != "" {
+			return segments[i]
+		}
+	}
+	return ""
+}
 
 func GetFullURL(path string) string {
 	fullURL := fmt.Sprintf("https://medal.tv/%s", path)

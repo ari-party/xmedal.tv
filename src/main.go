@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -28,12 +30,54 @@ var (
 	genericUserAgent = "Mozilla/5.0 (compatible; xmedaltv/1.0; +https://xmedal.tv)"
 )
 
-func fetchContentURL(ctx context.Context, url string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
+	apiURL := fmt.Sprintf("https://medal.tv/api/content/%s", clipID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", genericUserAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("api returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
 
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+
+	raw, ok := payload["contentUrl144p"].(string)
+	if !ok || raw == "" {
+		return "", errors.New("contentUrl144p missing from api response")
+	}
+
+	if parsed, err := url.Parse(raw); err == nil {
+		q := parsed.Query()
+		q.Del("t")
+		parsed.RawQuery = q.Encode()
+		return parsed.String(), nil
+	}
+	return raw, nil
+}
+
+func fetchViaPage(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("User-Agent", genericUserAgent)
 
 	resp, err := httpClient.Do(req)
@@ -56,12 +100,21 @@ func fetchContentURL(ctx context.Context, url string) (string, error) {
 		return "", err
 	}
 
-	contentURL, err := utils.ExtractContentURL(string(body))
-	if err != nil {
-		return "", err
+	return utils.ExtractContentURL(string(body))
+}
+
+func fetchContentURL(ctx context.Context, path string) (string, error) {
+	log := utils.Logger()
+
+	if clipID := utils.ExtractClipID(path); clipID != "" {
+		if url, err := fetchViaAPI(ctx, clipID); err == nil {
+			return url, nil
+		} else {
+			log.Warn("api fetch failed, falling back to page scrape", "clip_id", clipID, "error", err)
+		}
 	}
 
-	return contentURL, nil
+	return fetchViaPage(ctx, utils.GetFullURL(path))
 }
 
 func redirect(w http.ResponseWriter, destination string, status int) {
@@ -84,7 +137,7 @@ func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
 
 		if contentURL == "" {
 			result, fetchErr, _ := fetchGroup.Do(key, func() (interface{}, error) {
-				fetchedURL, innerErr := fetchContentURL(ctx, fullURL)
+				fetchedURL, innerErr := fetchContentURL(ctx, path)
 				if innerErr != nil {
 					return "", innerErr
 				}
