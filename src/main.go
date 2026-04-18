@@ -111,7 +111,7 @@ func fetchViaPage(ctx context.Context, url string) (string, error) {
 func fetchContentURL(ctx context.Context, path string) (string, error) {
 	log := utils.Logger()
 
-	if clipID := utils.ExtractClipID(path); clipID != "" {
+	if clipID := utils.ExtractClipID(path); clipID != "" && !utils.IsContentAPIBlacklisted(clipID) {
 		if url, err := fetchViaAPI(ctx, clipID); err == nil {
 			return url, nil
 		} else {

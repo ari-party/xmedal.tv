@@ -39,6 +39,15 @@ func ExtractMedalExpiry(contentURL string) time.Duration {
 	return fallback
 }
 
+var contentAPIPathBlacklist = map[string]struct{}{
+	"robots.txt": {},
+}
+
+func IsContentAPIBlacklisted(segment string) bool {
+	_, ok := contentAPIPathBlacklist[strings.ToLower(segment)]
+	return ok
+}
+
 func ExtractClipID(path string) string {
 	segments := strings.Split(strings.Trim(path, "/"), "/")
 	for i := len(segments) - 1; i >= 0; i-- {
