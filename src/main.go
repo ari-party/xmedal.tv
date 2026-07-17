@@ -27,7 +27,7 @@ var (
 
 	fetchGroup singleflight.Group
 
-	genericUserAgent = "Mozilla/5.0 (compatible; xmedaltv/1.0; +https://xmedal.tv)"
+	genericUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
