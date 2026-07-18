@@ -45,6 +45,9 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return "", errNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("api returned status %d", resp.StatusCode)
 	}
@@ -112,11 +115,14 @@ func fetchContentURL(ctx context.Context, path string) (string, error) {
 	log := utils.Logger()
 
 	if clipID := utils.ExtractClipID(path); clipID != "" && !utils.IsContentAPIBlacklisted(clipID) {
-		if url, err := fetchViaAPI(ctx, clipID); err == nil {
+		url, err := fetchViaAPI(ctx, clipID)
+		if err == nil {
 			return url, nil
-		} else {
-			log.Warn("api fetch failed, falling back to page scrape", "clip_id", clipID, "error", err)
 		}
+		if errors.Is(err, errNotFound) {
+			return "", errNotFound
+		}
+		log.Warn("api fetch failed, falling back to page scrape", "clip_id", clipID, "error", err)
 	}
 
 	return fetchViaPage(ctx, utils.GetFullURL(path))
