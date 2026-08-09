@@ -37,7 +37,14 @@ var (
 	genericUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+func timing(start time.Time, stage string, args ...any) {
+	args = append(args, "stage", stage, "ms", float64(time.Since(start).Microseconds())/1000)
+	utils.Logger().Info("timing", args...)
+}
+
 func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
+	defer timing(time.Now(), "medal_api", "clip_id", clipID)
+
 	apiURL := fmt.Sprintf("https://medal.tv/api/content/%s", clipID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
@@ -89,6 +96,8 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 }
 
 func fetchViaPage(ctx context.Context, url string) (string, error) {
+	defer timing(time.Now(), "page_scrape", "url", url)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -120,6 +129,8 @@ func fetchViaPage(ctx context.Context, url string) (string, error) {
 
 // contentUrl just 302s to the real presigned asset, so we follow it ourselves
 func resolvePresignedURL(ctx context.Context, contentURL string) string {
+	defer timing(time.Now(), "cdn_presign")
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, contentURL, nil)
 	if err != nil {
 		return contentURL
@@ -147,6 +158,8 @@ func resolvePresignedURL(ctx context.Context, contentURL string) string {
 }
 
 func fetchViaResolver(ctx context.Context, resolverURL, path string) (string, error) {
+	defer timing(time.Now(), "resolver_hop", "path", path)
+
 	endpoint := strings.TrimSuffix(resolverURL, "/") + "/resolve?path=" + url.QueryEscape(path)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -210,15 +223,19 @@ func resolveContentURL(ctx context.Context, path string) (string, error) {
 	log := utils.Logger()
 	key := slug.Make(path)
 
+	readStart := time.Now()
 	contentURL, err := redis.GetCachedContentURL(ctx, key)
 	if err != nil {
 		log.Error("failed to read from cache", "error", err)
 	}
+	timing(readStart, "cache_read", "key", key, "hit", contentURL != "")
+
 	if contentURL != "" {
 		return contentURL, nil
 	}
 
-	result, err, _ := fetchGroup.Do(key, func() (interface{}, error) {
+	fetchStart := time.Now()
+	result, err, shared := fetchGroup.Do(key, func() (interface{}, error) {
 		// not the caller's ctx, one crawler hanging up would kill the fetch
 		// everyone else is waiting on
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -229,12 +246,16 @@ func resolveContentURL(ctx context.Context, path string) (string, error) {
 			return "", err
 		}
 
+		writeStart := time.Now()
 		if err := redis.SetCachedContentURL(ctx, key, fetchedURL, utils.ExtractMedalExpiry(fetchedURL)); err != nil {
 			log.Error("failed to cache content url", "error", err)
 		}
+		timing(writeStart, "cache_write", "key", key)
 
 		return fetchedURL, nil
 	})
+	timing(fetchStart, "fetch", "key", key, "deduplicated", shared)
+
 	if err != nil {
 		return "", err
 	}
@@ -249,6 +270,8 @@ func redirect(w http.ResponseWriter, destination string, status int) {
 }
 
 func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
+	defer timing(time.Now(), "request", "path", r.URL.Path)
+
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
 	if nodeEnv != "development" && !utils.IsBot(r.UserAgent()) {
@@ -272,6 +295,8 @@ func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
 }
 
 func handleResolve(w http.ResponseWriter, r *http.Request) {
+	defer timing(time.Now(), "resolve_request", "path", r.URL.Query().Get("path"))
+
 	path := strings.TrimPrefix(r.URL.Query().Get("path"), "/")
 	if path == "" {
 		http.Error(w, "missing path", http.StatusBadRequest)
