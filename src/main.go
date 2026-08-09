@@ -62,7 +62,7 @@ func timing(start time.Time, stage string, args ...any) {
 }
 
 func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
-	defer timing(time.Now(), "medal_api", "clip_id", clipID)
+	start := time.Now()
 
 	apiURL := fmt.Sprintf("https://medal.tv/api/content/%s", clipID)
 
@@ -94,11 +94,14 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", err
 	}
+	timing(start, "medal_api", "clip_id", clipID)
 
 	var raw string
+	var isThumbnail bool
 	for _, field := range apiURLFields {
 		if value, ok := payload[field].(string); ok && value != "" {
 			raw = value
+			isThumbnail = strings.HasPrefix(field, "thumbnail")
 			break
 		}
 	}
@@ -115,9 +118,15 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 			}
 		}
 		parsed.RawQuery = strings.Join(filtered, "&")
-		return parsed.String(), nil
+		raw = parsed.String()
 	}
-	return raw, nil
+
+	// thumbnails are already the final asset, only videos go through the cdn redirect
+	if isThumbnail {
+		return raw, nil
+	}
+
+	return resolvePresignedURL(ctx, raw), nil
 }
 
 func fetchViaPage(ctx context.Context, url string) (string, error) {
@@ -228,7 +237,7 @@ func fetchContentURL(ctx context.Context, path string) (string, error) {
 	if clipID := utils.ExtractClipID(path); clipID != "" && !utils.IsContentAPIBlacklisted(clipID) {
 		contentURL, err := fetchViaAPI(ctx, clipID)
 		if err == nil {
-			return resolvePresignedURL(ctx, contentURL), nil
+			return contentURL, nil
 		}
 		if errors.Is(err, errNotFound) {
 			return "", errNotFound
