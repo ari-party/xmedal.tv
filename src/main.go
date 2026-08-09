@@ -37,6 +37,10 @@ var (
 	genericUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+func isResolver() bool {
+	return utils.LoadConfig().ResolverURL == ""
+}
+
 func timing(start time.Time, stage string, args ...any) {
 	args = append(args, "stage", stage, "ms", float64(time.Since(start).Microseconds())/1000)
 	utils.Logger().Info("timing", args...)
@@ -223,15 +227,26 @@ func resolveContentURL(ctx context.Context, path string) (string, error) {
 	log := utils.Logger()
 	key := slug.Make(path)
 
-	readStart := time.Now()
-	contentURL, err := redis.GetCachedContentURL(ctx, key)
-	if err != nil {
-		log.Error("failed to read from cache", "error", err)
-	}
-	timing(readStart, "cache_read", "key", key, "hit", contentURL != "")
+	memoryStart := time.Now()
+	contentURL := memoryGet(key)
+	timing(memoryStart, "memory_read", "key", key, "hit", contentURL != "")
 
 	if contentURL != "" {
 		return contentURL, nil
+	}
+
+	if isResolver() {
+		readStart := time.Now()
+		contentURL, err := redis.GetCachedContentURL(ctx, key)
+		if err != nil {
+			log.Error("failed to read from cache", "error", err)
+		}
+		timing(readStart, "cache_read", "key", key, "hit", contentURL != "")
+
+		if contentURL != "" {
+			memorySet(key, contentURL, utils.ExtractMedalExpiry(contentURL))
+			return contentURL, nil
+		}
 	}
 
 	fetchStart := time.Now()
@@ -246,11 +261,16 @@ func resolveContentURL(ctx context.Context, path string) (string, error) {
 			return "", err
 		}
 
-		writeStart := time.Now()
-		if err := redis.SetCachedContentURL(ctx, key, fetchedURL, utils.ExtractMedalExpiry(fetchedURL)); err != nil {
-			log.Error("failed to cache content url", "error", err)
+		ttl := utils.ExtractMedalExpiry(fetchedURL)
+		memorySet(key, fetchedURL, ttl)
+
+		if isResolver() {
+			writeStart := time.Now()
+			if err := redis.SetCachedContentURL(ctx, key, fetchedURL, ttl); err != nil {
+				log.Error("failed to cache content url", "error", err)
+			}
+			timing(writeStart, "cache_write", "key", key)
 		}
-		timing(writeStart, "cache_write", "key", key)
 
 		return fetchedURL, nil
 	})
@@ -323,7 +343,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	if err := redis.Ping(ctx); err != nil {
+	if isResolver() && redis.Ping(ctx) != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte("NOT OK"))
 		return
@@ -337,11 +357,10 @@ func main() {
 	cfg := utils.LoadConfig()
 	log := utils.Logger()
 
-	redis.Client()
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
-	if cfg.ResolverURL == "" {
+	if isResolver() {
+		redis.Client()
 		mux.HandleFunc("/resolve", handleResolve)
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
