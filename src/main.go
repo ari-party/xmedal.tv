@@ -35,6 +35,21 @@ var (
 	fetchGroup singleflight.Group
 
 	genericUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+	apiURLFields = []string{
+		"contentUrl1080p",
+		"contentUrl720p",
+		"contentUrl480p",
+		"contentUrl360p",
+		"contentUrl240p",
+		"contentUrl144p",
+		"thumbnail1080p",
+		"thumbnail720p",
+		"thumbnail480p",
+		"thumbnail360p",
+		"thumbnail240p",
+		"thumbnail144p",
+	}
 )
 
 func isResolver() bool {
@@ -80,9 +95,15 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 		return "", err
 	}
 
-	raw, ok := payload["contentUrl144p"].(string)
-	if !ok || raw == "" {
-		return "", errors.New("contentUrl144p missing from api response")
+	var raw string
+	for _, field := range apiURLFields {
+		if value, ok := payload[field].(string); ok && value != "" {
+			raw = value
+			break
+		}
+	}
+	if raw == "" {
+		return "", errors.New("no content or thumbnail url in api response")
 	}
 
 	if parsed, err := url.Parse(raw); err == nil {
