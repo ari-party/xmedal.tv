@@ -23,6 +23,13 @@ var (
 		Timeout: 15 * time.Second,
 	}
 
+	noRedirectClient = &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
 	errNotFound = errors.New("content not found")
 
 	fetchGroup singleflight.Group
@@ -111,13 +118,79 @@ func fetchViaPage(ctx context.Context, url string) (string, error) {
 	return utils.ExtractContentURL(string(body))
 }
 
+// contentUrl just 302s to the real presigned asset, so we follow it ourselves
+func resolvePresignedURL(ctx context.Context, contentURL string) string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, contentURL, nil)
+	if err != nil {
+		return contentURL
+	}
+	req.Header.Set("User-Agent", genericUserAgent)
+
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		utils.Logger().Warn("presign resolve failed, using content url", "error", err)
+		return contentURL
+	}
+	defer resp.Body.Close()
+
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return contentURL
+	}
+
+	absolute, err := resp.Request.URL.Parse(location)
+	if err != nil {
+		return contentURL
+	}
+
+	return absolute.String()
+}
+
+func fetchViaResolver(ctx context.Context, resolverURL, path string) (string, error) {
+	endpoint := strings.TrimSuffix(resolverURL, "/") + "/resolve?path=" + url.QueryEscape(path)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", errNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("resolver returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	if err != nil {
+		return "", err
+	}
+
+	resolved := strings.TrimSpace(string(body))
+	if resolved == "" {
+		return "", errors.New("resolver returned an empty url")
+	}
+
+	return resolved, nil
+}
+
 func fetchContentURL(ctx context.Context, path string) (string, error) {
 	log := utils.Logger()
 
+	if resolver := utils.LoadConfig().ResolverURL; resolver != "" {
+		return fetchViaResolver(ctx, resolver, path)
+	}
+
 	if clipID := utils.ExtractClipID(path); clipID != "" && !utils.IsContentAPIBlacklisted(clipID) {
-		url, err := fetchViaAPI(ctx, clipID)
+		contentURL, err := fetchViaAPI(ctx, clipID)
 		if err == nil {
-			return url, nil
+			return resolvePresignedURL(ctx, contentURL), nil
 		}
 		if errors.Is(err, errNotFound) {
 			return "", errNotFound
@@ -125,7 +198,49 @@ func fetchContentURL(ctx context.Context, path string) (string, error) {
 		log.Warn("api fetch failed, falling back to page scrape", "clip_id", clipID, "error", err)
 	}
 
-	return fetchViaPage(ctx, utils.GetFullURL(path))
+	contentURL, err := fetchViaPage(ctx, utils.GetFullURL(path))
+	if err != nil {
+		return "", err
+	}
+
+	return resolvePresignedURL(ctx, contentURL), nil
+}
+
+func resolveContentURL(ctx context.Context, path string) (string, error) {
+	log := utils.Logger()
+	key := slug.Make(path)
+
+	contentURL, err := redis.GetCachedContentURL(ctx, key)
+	if err != nil {
+		log.Error("failed to read from cache", "error", err)
+	}
+	if contentURL != "" {
+		return contentURL, nil
+	}
+
+	result, err, _ := fetchGroup.Do(key, func() (interface{}, error) {
+		// not the caller's ctx, one crawler hanging up would kill the fetch
+		// everyone else is waiting on
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+
+		fetchedURL, err := fetchContentURL(ctx, path)
+		if err != nil {
+			return "", err
+		}
+
+		if err := redis.SetCachedContentURL(ctx, key, fetchedURL, utils.ExtractMedalExpiry(fetchedURL)); err != nil {
+			log.Error("failed to cache content url", "error", err)
+		}
+
+		return fetchedURL, nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	contentURL, _ = result.(string)
+	return contentURL, nil
 }
 
 func redirect(w http.ResponseWriter, destination string, status int) {
@@ -134,51 +249,49 @@ func redirect(w http.ResponseWriter, destination string, status int) {
 }
 
 func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
-	log := utils.Logger()
 	path := strings.TrimPrefix(r.URL.Path, "/")
-	key := slug.Make(path)
-	fullURL := utils.GetFullURL(path)
 
-	if nodeEnv == "development" || utils.IsBot(r.UserAgent()) {
-		ctx := r.Context()
-		contentURL, err := redis.GetCachedContentURL(ctx, key)
-		if err != nil {
-			log.Error("failed to read from cache", "error", err)
-		}
-
-		if contentURL == "" {
-			result, fetchErr, _ := fetchGroup.Do(key, func() (interface{}, error) {
-				fetchedURL, innerErr := fetchContentURL(ctx, path)
-				if innerErr != nil {
-					return "", innerErr
-				}
-
-				if err := redis.SetCachedContentURL(ctx, key, fetchedURL, utils.ExtractMedalExpiry(fetchedURL)); err != nil {
-					log.Error("failed to cache content url", "error", err)
-				}
-
-				return fetchedURL, nil
-			})
-
-			if fetchErr != nil {
-				if errors.Is(fetchErr, errNotFound) {
-					http.NotFound(w, r)
-					return
-				}
-
-				log.Error("failed to fetch content url", "error", fetchErr)
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				return
-			}
-
-			contentURL, _ = result.(string)
-		}
-
-		redirect(w, contentURL, http.StatusFound)
+	if nodeEnv != "development" && !utils.IsBot(r.UserAgent()) {
+		redirect(w, utils.GetFullURL(path), http.StatusFound)
 		return
 	}
 
-	redirect(w, fullURL, http.StatusFound)
+	contentURL, err := resolveContentURL(r.Context(), path)
+	if err != nil {
+		if errors.Is(err, errNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+
+		utils.Logger().Error("failed to fetch content url", "error", err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	redirect(w, contentURL, http.StatusFound)
+}
+
+func handleResolve(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Query().Get("path"), "/")
+	if path == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+
+	contentURL, err := resolveContentURL(r.Context(), path)
+	if err != nil {
+		if errors.Is(err, errNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+
+		utils.Logger().Error("failed to resolve content url", "error", err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(contentURL))
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +316,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
+	if cfg.ResolverURL == "" {
+		mux.HandleFunc("/resolve", handleResolve)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			redirect(w, "https://github.com/ari-party/xmedal.tv#xmedaltv", http.StatusFound)
@@ -212,7 +328,8 @@ func main() {
 		handleContent(w, r, cfg.NodeEnv)
 	})
 
-	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
+	// not 0.0.0.0, railway's private network is ipv6 only and edges couldn't reach us
+	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Info("server listening", "addr", addr)
 
 	if err := http.ListenAndServe(addr, mux); err != nil {

@@ -11,6 +11,7 @@ type Config struct {
 	NodeEnv  string `env:"NODE_ENV" envDefault:"development"`
 	Port     int    `env:"PORT" envDefault:"3000"`
 	RedisURL string `env:"REDIS_URL" envDefault:"redis://localhost:6379"`
+	ResolverURL string `env:"RESOLVER_URL"`
 }
 
 var (
