@@ -461,7 +461,6 @@ func main() {
 		handleContent(w, r, cfg.NodeEnv)
 	})
 
-	// not 0.0.0.0, railway's private network is ipv6 only and edges couldn't reach us
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	log.Info("server listening", "addr", addr)
 
