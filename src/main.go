@@ -18,6 +18,12 @@ import (
 	"xmedaltv/src/utils"
 )
 
+const (
+	presignDeadline = 750 * time.Millisecond
+	pendingCacheTTL = 30 * time.Second
+	pendingHeader   = "X-Xmedal-Pending"
+)
+
 var (
 	httpClient = &http.Client{
 		Timeout: 15 * time.Second,
@@ -56,43 +62,49 @@ func isResolver() bool {
 	return utils.LoadConfig().ResolverURL == ""
 }
 
+// pending means contentURL is the un-followed one and still needs the presign hop
+type resolution struct {
+	contentURL string
+	pending    bool
+}
+
 func timing(start time.Time, stage string, args ...any) {
 	args = append(args, "stage", stage, "ms", float64(time.Since(start).Microseconds())/1000)
 	utils.Logger().Info("timing", args...)
 }
 
-func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
+func fetchViaAPI(ctx context.Context, clipID string) (resolution, error) {
 	start := time.Now()
 
 	apiURL := fmt.Sprintf("https://medal.tv/api/content/%s", clipID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 	req.Header.Set("User-Agent", genericUserAgent)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return "", errNotFound
+		return resolution{}, errNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("api returned status %d", resp.StatusCode)
+		return resolution{}, fmt.Errorf("api returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", err
+		return resolution{}, err
 	}
 	timing(start, "medal_api", "clip_id", clipID)
 
@@ -106,7 +118,7 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 		}
 	}
 	if raw == "" {
-		return "", errors.New("no content or thumbnail url in api response")
+		return resolution{}, errors.New("no content or thumbnail url in api response")
 	}
 
 	if parsed, err := url.Parse(raw); err == nil {
@@ -123,10 +135,12 @@ func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 
 	// thumbnails are already the final asset, only videos go through the cdn redirect
 	if isThumbnail {
-		return raw, nil
+		return resolution{contentURL: raw}, nil
 	}
 
-	return resolvePresignedURL(ctx, raw), nil
+	contentURL, resolved := resolvePresignedURL(ctx, raw, presignDeadline)
+
+	return resolution{contentURL: contentURL, pending: !resolved}, nil
 }
 
 func fetchViaPage(ctx context.Context, url string) (string, error) {
@@ -161,73 +175,83 @@ func fetchViaPage(ctx context.Context, url string) (string, error) {
 	return utils.ExtractContentURL(string(body))
 }
 
-// contentUrl just 302s to the real presigned asset, so we follow it ourselves
-func resolvePresignedURL(ctx context.Context, contentURL string) string {
-	defer timing(time.Now(), "cdn_presign")
+// contentUrl just 302s to the real presigned asset, so we follow it to save a hop
+func resolvePresignedURL(ctx context.Context, contentURL string, timeout time.Duration) (finalURL string, resolved bool) {
+	start := time.Now()
+	defer func() { timing(start, "cdn_presign", "resolved", resolved) }()
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, contentURL, nil)
 	if err != nil {
-		return contentURL
+		return contentURL, false
 	}
 	req.Header.Set("User-Agent", genericUserAgent)
 
 	resp, err := noRedirectClient.Do(req)
 	if err != nil {
-		utils.Logger().Warn("presign resolve failed, using content url", "error", err)
-		return contentURL
+		if errors.Is(err, context.DeadlineExceeded) {
+			utils.Logger().Info("presign hop too slow, handing out the un-followed url", "url", contentURL)
+		} else {
+			utils.Logger().Warn("presign resolve failed, using content url", "error", err)
+		}
+
+		return contentURL, false
 	}
 	defer resp.Body.Close()
 
+	// no redirect means it's already the final asset
 	location := resp.Header.Get("Location")
 	if location == "" {
-		return contentURL
+		return contentURL, true
 	}
 
 	absolute, err := resp.Request.URL.Parse(location)
 	if err != nil {
-		return contentURL
+		return contentURL, false
 	}
 
-	return absolute.String()
+	return absolute.String(), true
 }
 
-func fetchViaResolver(ctx context.Context, resolverURL, path string) (string, error) {
+func fetchViaResolver(ctx context.Context, resolverURL, path string) (resolution, error) {
 	defer timing(time.Now(), "resolver_hop", "path", path)
 
 	endpoint := strings.TrimSuffix(resolverURL, "/") + "/resolve?path=" + url.QueryEscape(path)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return "", errNotFound
+		return resolution{}, errNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("resolver returned status %d", resp.StatusCode)
+		return resolution{}, fmt.Errorf("resolver returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 
 	resolved := strings.TrimSpace(string(body))
 	if resolved == "" {
-		return "", errors.New("resolver returned an empty url")
+		return resolution{}, errors.New("resolver returned an empty url")
 	}
 
-	return resolved, nil
+	return resolution{contentURL: resolved, pending: resp.Header.Get(pendingHeader) == "1"}, nil
 }
 
-func fetchContentURL(ctx context.Context, path string) (string, error) {
+func fetchContentURL(ctx context.Context, path string) (resolution, error) {
 	log := utils.Logger()
 
 	if resolver := utils.LoadConfig().ResolverURL; resolver != "" {
@@ -235,47 +259,82 @@ func fetchContentURL(ctx context.Context, path string) (string, error) {
 	}
 
 	if clipID := utils.ExtractClipID(path); clipID != "" && !utils.IsContentAPIBlacklisted(clipID) {
-		contentURL, err := fetchViaAPI(ctx, clipID)
+		res, err := fetchViaAPI(ctx, clipID)
 		if err == nil {
-			return contentURL, nil
+			return res, nil
 		}
 		if errors.Is(err, errNotFound) {
-			return "", errNotFound
+			return resolution{}, errNotFound
 		}
 		log.Warn("api fetch failed, falling back to page scrape", "clip_id", clipID, "error", err)
 	}
 
-	contentURL, err := fetchViaPage(ctx, utils.GetFullURL(path))
+	scraped, err := fetchViaPage(ctx, utils.GetFullURL(path))
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 
-	return resolvePresignedURL(ctx, contentURL), nil
+	contentURL, resolved := resolvePresignedURL(ctx, scraped, presignDeadline)
+
+	return resolution{contentURL: contentURL, pending: !resolved}, nil
 }
 
-func resolveContentURL(ctx context.Context, path string) (string, error) {
+func cacheResolution(ctx context.Context, key string, res resolution) {
+	if res.pending {
+		memorySet(key, res.contentURL, true, pendingCacheTTL)
+		return
+	}
+
+	ttl := utils.ExtractMedalExpiry(res.contentURL)
+	memorySet(key, res.contentURL, false, ttl)
+
+	if isResolver() {
+		writeStart := time.Now()
+		if err := redis.SetCachedContentURL(ctx, key, res.contentURL, ttl); err != nil {
+			utils.Logger().Error("failed to cache content url", "error", err)
+		}
+		timing(writeStart, "cache_write", "key", key)
+	}
+}
+
+func completeResolution(key, rawURL string) {
+	// nothing is waiting on this, noRedirectClient's 15s timeout caps it anyway
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	contentURL, resolved := resolvePresignedURL(ctx, rawURL, 30*time.Second)
+	if !resolved {
+		utils.Logger().Warn("background presign resolve failed", "key", key)
+		return
+	}
+
+	cacheResolution(ctx, key, resolution{contentURL: contentURL})
+}
+
+func resolveContentURL(ctx context.Context, path string) (resolution, error) {
 	log := utils.Logger()
 	key := slug.Make(path)
 
 	memoryStart := time.Now()
-	contentURL := memoryGet(key)
+	contentURL, pending := memoryGet(key)
 	timing(memoryStart, "memory_read", "key", key, "hit", contentURL != "")
 
 	if contentURL != "" {
-		return contentURL, nil
+		return resolution{contentURL: contentURL, pending: pending}, nil
 	}
 
 	if isResolver() {
 		readStart := time.Now()
-		contentURL, err := redis.GetCachedContentURL(ctx, key)
+		cached, err := redis.GetCachedContentURL(ctx, key)
 		if err != nil {
 			log.Error("failed to read from cache", "error", err)
 		}
-		timing(readStart, "cache_read", "key", key, "hit", contentURL != "")
+		timing(readStart, "cache_read", "key", key, "hit", cached != "")
 
-		if contentURL != "" {
-			memorySet(key, contentURL, utils.ExtractMedalExpiry(contentURL))
-			return contentURL, nil
+		// only resolved urls ever reach redis
+		if cached != "" {
+			memorySet(key, cached, false, utils.ExtractMedalExpiry(cached))
+			return resolution{contentURL: cached}, nil
 		}
 	}
 
@@ -286,32 +345,28 @@ func resolveContentURL(ctx context.Context, path string) (string, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 
-		fetchedURL, err := fetchContentURL(ctx, path)
+		res, err := fetchContentURL(ctx, path)
 		if err != nil {
-			return "", err
+			return resolution{}, err
 		}
 
-		ttl := utils.ExtractMedalExpiry(fetchedURL)
-		memorySet(key, fetchedURL, ttl)
+		cacheResolution(ctx, key, res)
 
-		if isResolver() {
-			writeStart := time.Now()
-			if err := redis.SetCachedContentURL(ctx, key, fetchedURL, ttl); err != nil {
-				log.Error("failed to cache content url", "error", err)
-			}
-			timing(writeStart, "cache_write", "key", key)
+		// a worker's pending url came from the resolver, which is already on it
+		if res.pending && isResolver() {
+			go completeResolution(key, res.contentURL)
 		}
 
-		return fetchedURL, nil
+		return res, nil
 	})
 	timing(fetchStart, "fetch", "key", key, "deduplicated", shared)
 
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 
-	contentURL, _ = result.(string)
-	return contentURL, nil
+	res, _ := result.(resolution)
+	return res, nil
 }
 
 func redirect(w http.ResponseWriter, destination string, status int) {
@@ -329,7 +384,7 @@ func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
 		return
 	}
 
-	contentURL, err := resolveContentURL(r.Context(), path)
+	res, err := resolveContentURL(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, errNotFound) {
 			http.NotFound(w, r)
@@ -341,7 +396,7 @@ func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
 		return
 	}
 
-	redirect(w, contentURL, http.StatusFound)
+	redirect(w, res.contentURL, http.StatusFound)
 }
 
 func handleResolve(w http.ResponseWriter, r *http.Request) {
@@ -353,7 +408,7 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentURL, err := resolveContentURL(r.Context(), path)
+	res, err := resolveContentURL(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, errNotFound) {
 			http.NotFound(w, r)
@@ -365,8 +420,12 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if res.pending {
+		w.Header().Set(pendingHeader, "1")
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte(contentURL))
+	_, _ = w.Write([]byte(res.contentURL))
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
