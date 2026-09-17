@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	presignDeadline = 750 * time.Millisecond
+	presignDeadline = 850 * time.Millisecond
 	pendingCacheTTL = 30 * time.Second
 	pendingHeader   = "X-Xmedal-Pending"
 )
