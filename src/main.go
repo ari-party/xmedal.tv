@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	presignDeadline = 850 * time.Millisecond
 	pendingCacheTTL = 30 * time.Second
 	pendingHeader   = "X-Xmedal-Pending"
 )
@@ -138,9 +137,7 @@ func fetchViaAPI(ctx context.Context, clipID string) (resolution, error) {
 		return resolution{contentURL: raw}, nil
 	}
 
-	contentURL, resolved := resolvePresignedURL(ctx, raw, presignDeadline)
-
-	return resolution{contentURL: contentURL, pending: !resolved}, nil
+	return resolution{contentURL: raw, pending: true}, nil
 }
 
 func fetchViaPage(ctx context.Context, url string) (string, error) {
@@ -176,12 +173,9 @@ func fetchViaPage(ctx context.Context, url string) (string, error) {
 }
 
 // contentUrl just 302s to the real presigned asset, so we follow it to save a hop
-func resolvePresignedURL(ctx context.Context, contentURL string, timeout time.Duration) (finalURL string, resolved bool) {
+func resolvePresignedURL(ctx context.Context, contentURL string) (finalURL string, resolved bool) {
 	start := time.Now()
 	defer func() { timing(start, "cdn_presign", "resolved", resolved) }()
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, contentURL, nil)
 	if err != nil {
@@ -191,12 +185,7 @@ func resolvePresignedURL(ctx context.Context, contentURL string, timeout time.Du
 
 	resp, err := noRedirectClient.Do(req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			utils.Logger().Info("presign hop too slow, handing out the un-followed url", "url", contentURL)
-		} else {
-			utils.Logger().Warn("presign resolve failed, using content url", "error", err)
-		}
-
+		utils.Logger().Warn("presign resolve failed, using content url", "error", err)
 		return contentURL, false
 	}
 	defer resp.Body.Close()
@@ -274,9 +263,7 @@ func fetchContentURL(ctx context.Context, path string) (resolution, error) {
 		return resolution{}, err
 	}
 
-	contentURL, resolved := resolvePresignedURL(ctx, scraped, presignDeadline)
-
-	return resolution{contentURL: contentURL, pending: !resolved}, nil
+	return resolution{contentURL: scraped, pending: true}, nil
 }
 
 func cacheResolution(ctx context.Context, key string, res resolution) {
@@ -302,7 +289,7 @@ func completeResolution(key, rawURL string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	contentURL, resolved := resolvePresignedURL(ctx, rawURL, 30*time.Second)
+	contentURL, resolved := resolvePresignedURL(ctx, rawURL)
 	if !resolved {
 		utils.Logger().Warn("background presign resolve failed", "key", key)
 		return
