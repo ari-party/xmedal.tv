@@ -41,13 +41,16 @@ var (
 
 	genericUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-	apiURLFields = []string{
+	contentURLFields = []string{
 		"contentUrl1080p",
 		"contentUrl720p",
 		"contentUrl480p",
 		"contentUrl360p",
 		"contentUrl240p",
 		"contentUrl144p",
+	}
+
+	thumbnailFields = []string{
 		"thumbnail1080p",
 		"thumbnail720p",
 		"thumbnail480p",
@@ -61,15 +64,44 @@ func isResolver() bool {
 	return utils.LoadConfig().ResolverURL == ""
 }
 
-// pending means contentURL is the un-followed one and still needs the presign hop
+// pending means contentURL is a stopgap and presignURL still needs its cdn hop
 type resolution struct {
 	contentURL string
+	presignURL string
 	pending    bool
 }
 
 func timing(start time.Time, stage string, args ...any) {
 	args = append(args, "stage", stage, "ms", float64(time.Since(start).Microseconds())/1000)
 	utils.Logger().Info("timing", args...)
+}
+
+func firstURLField(payload map[string]any, fields []string) string {
+	for _, field := range fields {
+		if value, ok := payload[field].(string); ok && value != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+func stripRenditionParam(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+
+	parts := strings.Split(parsed.RawQuery, "&")
+	filtered := parts[:0]
+	for _, p := range parts {
+		if p != "" && !strings.HasPrefix(p, "t=") {
+			filtered = append(filtered, p)
+		}
+	}
+	parsed.RawQuery = strings.Join(filtered, "&")
+
+	return parsed.String()
 }
 
 func fetchViaAPI(ctx context.Context, clipID string) (resolution, error) {
@@ -107,51 +139,37 @@ func fetchViaAPI(ctx context.Context, clipID string) (resolution, error) {
 	}
 	timing(start, "medal_api", "clip_id", clipID)
 
-	var raw string
-	var isThumbnail bool
-	for _, field := range apiURLFields {
-		if value, ok := payload[field].(string); ok && value != "" {
-			raw = value
-			isThumbnail = strings.HasPrefix(field, "thumbnail")
-			break
-		}
-	}
-	if raw == "" {
-		return resolution{}, errors.New("no content or thumbnail url in api response")
+	presignURL := stripRenditionParam(firstURLField(payload, contentURLFields))
+
+	// medal's own og:video, no cdn hop in front of it but a temporary encode
+	if social, _ := payload["socialMediaVideo"].(string); social != "" && presignURL != "" {
+		return resolution{contentURL: social, presignURL: presignURL, pending: true}, nil
 	}
 
-	if parsed, err := url.Parse(raw); err == nil {
-		parts := strings.Split(parsed.RawQuery, "&")
-		filtered := parts[:0]
-		for _, p := range parts {
-			if p != "" && !strings.HasPrefix(p, "t=") {
-				filtered = append(filtered, p)
-			}
-		}
-		parsed.RawQuery = strings.Join(filtered, "&")
-		raw = parsed.String()
+	if presignURL != "" {
+		return resolution{contentURL: presignURL, presignURL: presignURL, pending: true}, nil
 	}
 
-	// thumbnails are already the final asset, only videos go through the cdn redirect
-	if isThumbnail {
-		return resolution{contentURL: raw}, nil
+	// screenshots have no video to fall back from
+	if thumbnail := firstURLField(payload, thumbnailFields); thumbnail != "" {
+		return resolution{contentURL: thumbnail}, nil
 	}
 
-	return resolution{contentURL: raw, pending: true}, nil
+	return resolution{}, errors.New("no content or thumbnail url in api response")
 }
 
-func fetchViaPage(ctx context.Context, url string) (string, error) {
+func fetchViaPage(ctx context.Context, url string) (resolution, error) {
 	defer timing(time.Now(), "page_scrape", "url", url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 	req.Header.Set("User-Agent", genericUserAgent)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 	defer resp.Body.Close()
 
@@ -159,17 +177,22 @@ func fetchViaPage(ctx context.Context, url string) (string, error) {
 	case http.StatusOK:
 		// continue
 	case http.StatusNotFound:
-		return "", errNotFound
+		return resolution{}, errNotFound
 	default:
-		return "", fmt.Errorf("unexpected status code %d for %s", resp.StatusCode, url)
+		return resolution{}, fmt.Errorf("unexpected status code %d for %s", resp.StatusCode, url)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return resolution{}, err
 	}
 
-	return utils.ExtractContentURL(string(body))
+	contentURL, presignURL, err := utils.ExtractContentURL(string(body))
+	if err != nil {
+		return resolution{}, err
+	}
+
+	return resolution{contentURL: contentURL, presignURL: presignURL, pending: true}, nil
 }
 
 // contentUrl just 302s to the real presigned asset, so we follow it to save a hop
@@ -258,12 +281,7 @@ func fetchContentURL(ctx context.Context, path string) (resolution, error) {
 		log.Warn("api fetch failed, falling back to page scrape", "clip_id", clipID, "error", err)
 	}
 
-	scraped, err := fetchViaPage(ctx, utils.GetFullURL(path))
-	if err != nil {
-		return resolution{}, err
-	}
-
-	return resolution{contentURL: scraped, pending: true}, nil
+	return fetchViaPage(ctx, utils.GetFullURL(path))
 }
 
 func cacheResolution(ctx context.Context, key string, res resolution) {
@@ -340,8 +358,8 @@ func resolveContentURL(ctx context.Context, path string) (resolution, error) {
 		cacheResolution(ctx, key, res)
 
 		// a worker's pending url came from the resolver, which is already on it
-		if res.pending && isResolver() {
-			go completeResolution(key, res.contentURL)
+		if res.pending && res.presignURL != "" && isResolver() {
+			go completeResolution(key, res.presignURL)
 		}
 
 		return res, nil

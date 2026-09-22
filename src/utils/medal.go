@@ -72,54 +72,62 @@ func GetFullURL(path string) string {
 	return parsedURL.String()
 }
 
-func extractContentURLFromHydration(html string) string {
+func extractContentURLFromHydration(html string) (social, contentURL string) {
 	hydrationData := ExtractHydrationData(html)
 	if hydrationData == "" {
-		return ""
+		return "", ""
 	}
 	doc, err := ParseJSONLD(hydrationData)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	clips, ok := doc["clips"].(map[string]any)
 	if !ok || len(clips) == 0 {
-		return ""
+		return "", ""
 	}
 	for _, clip := range clips {
 		clipMap, ok := clip.(map[string]any)
 		if !ok {
 			continue
 		}
-		if url, ok := clipMap["contentUrl"].(string); ok && url != "" {
-			return url
+		url, ok := clipMap["contentUrl"].(string)
+		if !ok || url == "" {
+			continue
 		}
+		social, _ := clipMap["socialMediaVideo"].(string)
+		return social, url
 	}
-	return ""
+	return "", ""
 }
 
-func ExtractContentURL(html string) (string, error) {
-	if url := extractContentURLFromHydration(html); url != "" {
-		return url, nil
+// returns the url to hand out now and the contentUrl to upgrade to
+func ExtractContentURL(html string) (contentURL, presignURL string, err error) {
+	if social, url := extractContentURLFromHydration(html); url != "" {
+		if social != "" {
+			return social, url, nil
+		}
+
+		return url, url, nil
 	}
 
 	scripts := ExtractJSONLDScripts(html)
 	if len(scripts) == 0 {
-		return "", errors.New("no json-ld script found")
+		return "", "", errors.New("no json-ld script found")
 	}
 
 	document, err := ParseJSONLD(scripts[0])
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if document["@type"] != "VideoObject" {
-		return "", errors.New("json-ld @type is not VideoObject")
+		return "", "", errors.New("json-ld @type is not VideoObject")
 	}
 
 	value, ok := document["contentUrl"].(string)
 	if !ok || value == "" {
-		return "", errors.New("json-ld contentUrl is missing")
+		return "", "", errors.New("json-ld contentUrl is missing")
 	}
 
-	return value, nil
+	return value, value, nil
 }
