@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -70,64 +69,4 @@ func GetFullURL(path string) string {
 	parsedURL.Fragment = ""
 
 	return parsedURL.String()
-}
-
-func extractContentURLFromHydration(html string) (social, contentURL string) {
-	hydrationData := ExtractHydrationData(html)
-	if hydrationData == "" {
-		return "", ""
-	}
-	doc, err := ParseJSONLD(hydrationData)
-	if err != nil {
-		return "", ""
-	}
-	clips, ok := doc["clips"].(map[string]any)
-	if !ok || len(clips) == 0 {
-		return "", ""
-	}
-	for _, clip := range clips {
-		clipMap, ok := clip.(map[string]any)
-		if !ok {
-			continue
-		}
-		url, ok := clipMap["contentUrl"].(string)
-		if !ok || url == "" {
-			continue
-		}
-		social, _ := clipMap["socialMediaVideo"].(string)
-		return social, url
-	}
-	return "", ""
-}
-
-// returns the url to hand out now and the contentUrl to upgrade to
-func ExtractContentURL(html string) (contentURL, presignURL string, err error) {
-	if social, url := extractContentURLFromHydration(html); url != "" {
-		if social != "" {
-			return social, url, nil
-		}
-
-		return url, url, nil
-	}
-
-	scripts := ExtractJSONLDScripts(html)
-	if len(scripts) == 0 {
-		return "", "", errors.New("no json-ld script found")
-	}
-
-	document, err := ParseJSONLD(scripts[0])
-	if err != nil {
-		return "", "", err
-	}
-
-	if document["@type"] != "VideoObject" {
-		return "", "", errors.New("json-ld @type is not VideoObject")
-	}
-
-	value, ok := document["contentUrl"].(string)
-	if !ok || value == "" {
-		return "", "", errors.New("json-ld contentUrl is missing")
-	}
-
-	return value, value, nil
 }

@@ -18,18 +18,13 @@ import (
 	"xmedaltv/src/utils"
 )
 
-const (
-	pendingCacheTTL = 30 * time.Second
-	pendingHeader   = "X-Xmedal-Pending"
-)
-
 var (
 	httpClient = &http.Client{
 		Timeout: 15 * time.Second,
 	}
 
+	// no timeout, it carries the whole video body; the request's ctx bounds it
 	noRedirectClient = &http.Client{
-		Timeout: 15 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -62,13 +57,6 @@ var (
 
 func isResolver() bool {
 	return utils.LoadConfig().ResolverURL == ""
-}
-
-// pending means contentURL is a stopgap and presignURL still needs its cdn hop
-type resolution struct {
-	contentURL string
-	presignURL string
-	pending    bool
 }
 
 func timing(start time.Time, stage string, args ...any) {
@@ -104,243 +92,105 @@ func stripRenditionParam(rawURL string) string {
 	return parsed.String()
 }
 
-func fetchViaAPI(ctx context.Context, clipID string) (resolution, error) {
+func fetchViaAPI(ctx context.Context, clipID string) (string, error) {
 	start := time.Now()
 
 	apiURL := fmt.Sprintf("https://medal.tv/api/content/%s", clipID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return resolution{}, err
+		return "", err
 	}
 	req.Header.Set("User-Agent", genericUserAgent)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return resolution{}, err
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		return resolution{}, errNotFound
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
+		return "", errNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return resolution{}, fmt.Errorf("api returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("api returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resolution{}, err
+		return "", err
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return resolution{}, err
+		return "", err
 	}
 	timing(start, "medal_api", "clip_id", clipID)
 
-	presignURL := stripRenditionParam(firstURLField(payload, contentURLFields))
-
-	// medal's own og:video, no cdn hop in front of it but a temporary encode
-	if social, _ := payload["socialMediaVideo"].(string); social != "" && presignURL != "" {
-		return resolution{contentURL: social, presignURL: presignURL, pending: true}, nil
-	}
-
-	if presignURL != "" {
-		return resolution{contentURL: presignURL, presignURL: presignURL, pending: true}, nil
+	if contentURL := firstURLField(payload, contentURLFields); contentURL != "" {
+		return stripRenditionParam(contentURL), nil
 	}
 
 	// screenshots have no video to fall back from
 	if thumbnail := firstURLField(payload, thumbnailFields); thumbnail != "" {
-		return resolution{contentURL: thumbnail}, nil
+		return thumbnail, nil
 	}
 
-	return resolution{}, errors.New("no content or thumbnail url in api response")
+	return "", errors.New("no content or thumbnail url in api response")
 }
 
-func fetchViaPage(ctx context.Context, url string) (resolution, error) {
-	defer timing(time.Now(), "page_scrape", "url", url)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return resolution{}, err
-	}
-	req.Header.Set("User-Agent", genericUserAgent)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return resolution{}, err
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-		// continue
-	case http.StatusNotFound:
-		return resolution{}, errNotFound
-	default:
-		return resolution{}, fmt.Errorf("unexpected status code %d for %s", resp.StatusCode, url)
+func fetchContentURL(ctx context.Context, path string) (string, error) {
+	clipID := utils.ExtractClipID(path)
+	if clipID == "" || utils.IsContentAPIBlacklisted(clipID) {
+		return "", errNotFound
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resolution{}, err
-	}
-
-	contentURL, presignURL, err := utils.ExtractContentURL(string(body))
-	if err != nil {
-		return resolution{}, err
-	}
-
-	return resolution{contentURL: contentURL, presignURL: presignURL, pending: true}, nil
+	return fetchViaAPI(ctx, clipID)
 }
 
-// contentUrl just 302s to the real presigned asset, so we follow it to save a hop
-func resolvePresignedURL(ctx context.Context, contentURL string) (finalURL string, resolved bool) {
-	start := time.Now()
-	defer func() { timing(start, "cdn_presign", "resolved", resolved) }()
+func cachedContentURL(ctx context.Context, key string) string {
+	memoryStart := time.Now()
+	contentURL := memoryGet(key)
+	timing(memoryStart, "memory_read", "key", key, "hit", contentURL != "")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, contentURL, nil)
+	if contentURL != "" || !isResolver() {
+		return contentURL
+	}
+
+	readStart := time.Now()
+	cached, err := redis.GetCachedContentURL(ctx, key)
 	if err != nil {
-		return contentURL, false
+		utils.Logger().Error("failed to read from cache", "error", err)
 	}
-	req.Header.Set("User-Agent", genericUserAgent)
+	timing(readStart, "cache_read", "key", key, "hit", cached != "")
 
-	resp, err := noRedirectClient.Do(req)
-	if err != nil {
-		utils.Logger().Warn("presign resolve failed, using content url", "error", err)
-		return contentURL, false
-	}
-	defer resp.Body.Close()
-
-	// no redirect means it's already the final asset
-	location := resp.Header.Get("Location")
-	if location == "" {
-		return contentURL, true
+	if cached != "" {
+		memorySet(key, cached, utils.ExtractMedalExpiry(cached))
 	}
 
-	absolute, err := resp.Request.URL.Parse(location)
-	if err != nil {
-		return contentURL, false
-	}
-
-	return absolute.String(), true
+	return cached
 }
 
-func fetchViaResolver(ctx context.Context, resolverURL, path string) (resolution, error) {
-	defer timing(time.Now(), "resolver_hop", "path", path)
+func cacheContentURL(key, contentURL string) {
+	ttl := utils.ExtractMedalExpiry(contentURL)
+	memorySet(key, contentURL, ttl)
 
-	endpoint := strings.TrimSuffix(resolverURL, "/") + "/resolve?path=" + url.QueryEscape(path)
+	// off the download's path, a slow redis would otherwise hold up the first bytes
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return resolution{}, err
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return resolution{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return resolution{}, errNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
-		return resolution{}, fmt.Errorf("resolver returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-	if err != nil {
-		return resolution{}, err
-	}
-
-	resolved := strings.TrimSpace(string(body))
-	if resolved == "" {
-		return resolution{}, errors.New("resolver returned an empty url")
-	}
-
-	return resolution{contentURL: resolved, pending: resp.Header.Get(pendingHeader) == "1"}, nil
-}
-
-func fetchContentURL(ctx context.Context, path string) (resolution, error) {
-	log := utils.Logger()
-
-	if resolver := utils.LoadConfig().ResolverURL; resolver != "" {
-		return fetchViaResolver(ctx, resolver, path)
-	}
-
-	if clipID := utils.ExtractClipID(path); clipID != "" && !utils.IsContentAPIBlacklisted(clipID) {
-		res, err := fetchViaAPI(ctx, clipID)
-		if err == nil {
-			return res, nil
-		}
-		if errors.Is(err, errNotFound) {
-			return resolution{}, errNotFound
-		}
-		log.Warn("api fetch failed, falling back to page scrape", "clip_id", clipID, "error", err)
-	}
-
-	return fetchViaPage(ctx, utils.GetFullURL(path))
-}
-
-func cacheResolution(ctx context.Context, key string, res resolution) {
-	if res.pending {
-		memorySet(key, res.contentURL, true, pendingCacheTTL)
-		return
-	}
-
-	ttl := utils.ExtractMedalExpiry(res.contentURL)
-	memorySet(key, res.contentURL, false, ttl)
-
-	if isResolver() {
 		writeStart := time.Now()
-		if err := redis.SetCachedContentURL(ctx, key, res.contentURL, ttl); err != nil {
+		if err := redis.SetCachedContentURL(ctx, key, contentURL, ttl); err != nil {
 			utils.Logger().Error("failed to cache content url", "error", err)
 		}
 		timing(writeStart, "cache_write", "key", key)
-	}
+	}()
 }
 
-func completeResolution(key, rawURL string) {
-	// nothing is waiting on this, noRedirectClient's 15s timeout caps it anyway
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	contentURL, resolved := resolvePresignedURL(ctx, rawURL)
-	if !resolved {
-		utils.Logger().Warn("background presign resolve failed", "key", key)
-		return
-	}
-
-	cacheResolution(ctx, key, resolution{contentURL: contentURL})
-}
-
-func resolveContentURL(ctx context.Context, path string) (resolution, error) {
-	log := utils.Logger()
-	key := slug.Make(path)
-
-	memoryStart := time.Now()
-	contentURL, pending := memoryGet(key)
-	timing(memoryStart, "memory_read", "key", key, "hit", contentURL != "")
-
-	if contentURL != "" {
-		return resolution{contentURL: contentURL, pending: pending}, nil
-	}
-
-	if isResolver() {
-		readStart := time.Now()
-		cached, err := redis.GetCachedContentURL(ctx, key)
-		if err != nil {
-			log.Error("failed to read from cache", "error", err)
-		}
-		timing(readStart, "cache_read", "key", key, "hit", cached != "")
-
-		// only resolved urls ever reach redis
-		if cached != "" {
-			memorySet(key, cached, false, utils.ExtractMedalExpiry(cached))
-			return resolution{contentURL: cached}, nil
-		}
+func downloadFor(ctx context.Context, key, path string) (*download, error) {
+	if d := getDownload(key); d != nil {
+		return d, nil
 	}
 
 	fetchStart := time.Now()
@@ -350,28 +200,20 @@ func resolveContentURL(ctx context.Context, path string) (resolution, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 
-		res, err := fetchContentURL(ctx, path)
+		contentURL, err := fetchContentURL(ctx, path)
 		if err != nil {
-			return resolution{}, err
+			return nil, err
 		}
 
-		cacheResolution(ctx, key, res)
-
-		// a worker's pending url came from the resolver, which is already on it
-		if res.pending && res.presignURL != "" && isResolver() {
-			go completeResolution(key, res.presignURL)
-		}
-
-		return res, nil
+		return startDownload(key, contentURL), nil
 	})
 	timing(fetchStart, "fetch", "key", key, "deduplicated", shared)
 
 	if err != nil {
-		return resolution{}, err
+		return nil, err
 	}
 
-	res, _ := result.(resolution)
-	return res, nil
+	return result.(*download), nil
 }
 
 func redirect(w http.ResponseWriter, destination string, status int) {
@@ -379,33 +221,115 @@ func redirect(w http.ResponseWriter, destination string, status int) {
 	w.WriteHeader(status)
 }
 
-func handleContent(w http.ResponseWriter, r *http.Request, nodeEnv string) {
-	defer timing(time.Now(), "request", "path", r.URL.Path)
+func sendStreamHeaders(w http.ResponseWriter, contentType string) {
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(http.StatusOK)
+	_ = http.NewResponseController(w).Flush()
+}
 
-	path := strings.TrimPrefix(r.URL.Path, "/")
+func serveContent(w http.ResponseWriter, r *http.Request, path string) {
+	key := slug.Make(path)
 
-	if nodeEnv != "development" && !utils.IsBot(r.UserAgent()) {
-		redirect(w, utils.GetFullURL(path), http.StatusFound)
+	if contentURL := cachedContentURL(r.Context(), key); contentURL != "" {
+		redirect(w, contentURL, http.StatusFound)
 		return
 	}
 
-	res, err := resolveContentURL(r.Context(), path)
+	d, err := downloadFor(r.Context(), key, path)
 	if err != nil {
 		if errors.Is(err, errNotFound) {
 			http.NotFound(w, r)
 			return
 		}
 
-		utils.Logger().Error("failed to fetch content url", "error", err)
+		utils.Logger().Error("failed to fetch content url", "path", path, "error", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
-	redirect(w, res.contentURL, http.StatusFound)
+	// before the cdn hop, so crawlers don't give up on a slow first fetch
+	sendStreamHeaders(w, d.contentType)
+
+	if err := d.streamTo(r.Context(), w); err != nil {
+		if r.Context().Err() == nil {
+			utils.Logger().Error("failed to stream content", "path", path, "error", err)
+		}
+		// the 200 is already out, so reset the connection rather than end a truncated body cleanly
+		panic(http.ErrAbortHandler)
+	}
 }
 
-func handleResolve(w http.ResponseWriter, r *http.Request) {
-	defer timing(time.Now(), "resolve_request", "path", r.URL.Query().Get("path"))
+func proxyContent(w http.ResponseWriter, r *http.Request, resolverURL, path string) {
+	key := slug.Make(path)
+
+	if contentURL := cachedContentURL(r.Context(), key); contentURL != "" {
+		redirect(w, contentURL, http.StatusFound)
+		return
+	}
+
+	endpoint := strings.TrimSuffix(resolverURL, "/") + "/stream?path=" + url.QueryEscape(path)
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		utils.Logger().Error("resolver request failed", "error", err)
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusFound:
+		contentURL := resp.Header.Get("Location")
+		memorySet(key, contentURL, utils.ExtractMedalExpiry(contentURL))
+		redirect(w, contentURL, http.StatusFound)
+		return
+	case http.StatusOK:
+		// continue
+	case http.StatusNotFound:
+		http.NotFound(w, r)
+		return
+	default:
+		utils.Logger().Error("resolver returned unexpected status", "status", resp.StatusCode)
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		return
+	}
+
+	sendStreamHeaders(w, resp.Header.Get("Content-Type"))
+
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		if r.Context().Err() == nil {
+			utils.Logger().Error("failed to proxy stream", "path", path, "error", err)
+		}
+		panic(http.ErrAbortHandler)
+	}
+}
+
+func handleContent(w http.ResponseWriter, r *http.Request, cfg utils.Config) {
+	defer timing(time.Now(), "request", "path", r.URL.Path)
+
+	path := strings.TrimPrefix(r.URL.Path, "/")
+
+	if cfg.NodeEnv != "development" && !utils.IsBot(r.UserAgent()) {
+		redirect(w, utils.GetFullURL(path), http.StatusFound)
+		return
+	}
+
+	if cfg.ResolverURL != "" {
+		proxyContent(w, r, cfg.ResolverURL, path)
+		return
+	}
+
+	serveContent(w, r, path)
+}
+
+func handleStream(w http.ResponseWriter, r *http.Request) {
+	defer timing(time.Now(), "stream_request", "path", r.URL.Query().Get("path"))
 
 	path := strings.TrimPrefix(r.URL.Query().Get("path"), "/")
 	if path == "" {
@@ -413,24 +337,7 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := resolveContentURL(r.Context(), path)
-	if err != nil {
-		if errors.Is(err, errNotFound) {
-			http.NotFound(w, r)
-			return
-		}
-
-		utils.Logger().Error("failed to resolve content url", "error", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-
-	if res.pending {
-		w.Header().Set(pendingHeader, "1")
-	}
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte(res.contentURL))
+	serveContent(w, r, path)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -455,7 +362,7 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	if isResolver() {
 		redis.Client()
-		mux.HandleFunc("/resolve", handleResolve)
+		mux.HandleFunc("/stream", handleStream)
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -463,7 +370,7 @@ func main() {
 			return
 		}
 
-		handleContent(w, r, cfg.NodeEnv)
+		handleContent(w, r, cfg)
 	})
 
 	addr := fmt.Sprintf(":%d", cfg.Port)

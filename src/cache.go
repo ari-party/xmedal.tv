@@ -9,7 +9,6 @@ const memoryCacheCap = 10000
 
 type memoryEntry struct {
 	contentURL string
-	pending    bool
 	expiresAt  time.Time
 }
 
@@ -18,19 +17,19 @@ var (
 	memoryStore = map[string]memoryEntry{}
 )
 
-func memoryGet(key string) (string, bool) {
+func memoryGet(key string) string {
 	memoryMu.RLock()
 	entry, ok := memoryStore[key]
 	memoryMu.RUnlock()
 
 	if !ok || time.Now().After(entry.expiresAt) {
-		return "", false
+		return ""
 	}
 
-	return entry.contentURL, entry.pending
+	return entry.contentURL
 }
 
-func memorySet(key, contentURL string, pending bool, ttl time.Duration) {
+func memorySet(key, contentURL string, ttl time.Duration) {
 	now := time.Now()
 
 	memoryMu.Lock()
@@ -48,5 +47,5 @@ func memorySet(key, contentURL string, pending bool, ttl time.Duration) {
 		}
 	}
 
-	memoryStore[key] = memoryEntry{contentURL: contentURL, pending: pending, expiresAt: now.Add(ttl)}
+	memoryStore[key] = memoryEntry{contentURL: contentURL, expiresAt: now.Add(ttl)}
 }
