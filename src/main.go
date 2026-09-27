@@ -188,6 +188,13 @@ func cacheContentURL(key, contentURL string) {
 	}()
 }
 
+func contentKey(path string) string {
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	return slug.Make(path)
+}
+
 func downloadFor(ctx context.Context, key, path string) (*download, error) {
 	if d := getDownload(key); d != nil {
 		return d, nil
@@ -228,7 +235,7 @@ func sendStreamHeaders(w http.ResponseWriter, contentType string) {
 }
 
 func serveContent(w http.ResponseWriter, r *http.Request, path string) {
-	key := slug.Make(path)
+	key := contentKey(path)
 
 	if contentURL := cachedContentURL(r.Context(), key); contentURL != "" {
 		redirect(w, contentURL, http.StatusFound)
@@ -260,7 +267,7 @@ func serveContent(w http.ResponseWriter, r *http.Request, path string) {
 }
 
 func proxyContent(w http.ResponseWriter, r *http.Request, resolverURL, path string) {
-	key := slug.Make(path)
+	key := contentKey(path)
 
 	if contentURL := cachedContentURL(r.Context(), key); contentURL != "" {
 		redirect(w, contentURL, http.StatusFound)
@@ -339,7 +346,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	serveContent(w, r, path)
 }
-
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()

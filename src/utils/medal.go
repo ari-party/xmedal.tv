@@ -48,6 +48,11 @@ func IsContentAPIBlacklisted(segment string) bool {
 }
 
 func ExtractClipID(path string) string {
+	// strip query/fragment so /clips/abc?ainvite=xyz still yields "abc"
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+
 	segments := strings.Split(strings.Trim(path, "/"), "/")
 	for i := len(segments) - 1; i >= 0; i-- {
 		if segments[i] != "" {
